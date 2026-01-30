@@ -1,0 +1,209 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  ANALYST
+  AUDITOR
+}
+
+enum UnmatchedSystemStatus {
+  OVERDUE
+  DEFERRED
+}
+
+enum PendingStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum ChequeStatus {
+  ISSUED
+  CLEARED
+  OVERDUE
+}
+
+enum RunMemberRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(ANALYST)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  runs        ReconciliationRun[]
+  runMembers  RunMember[]
+  messages    Message[]
+}
+
+model ReconciliationRun {
+  id          String   @id @default(cuid())
+  title       String?
+  bankName    String?
+  accountRef  String?
+  windowDays  Int      @default(0)
+  cutDate     DateTime?
+  createdAt   DateTime @default(now())
+  createdById String
+
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  extractLines     ExtractLine[]
+  systemLines      SystemLine[]
+  matches          Match[]
+  unmatchedExtract UnmatchedExtract[]
+  unmatchedSystem  UnmatchedSystem[]
+  pendingItems     PendingItem[]
+  cheques          Cheque[]
+  members          RunMember[]
+  messages         Message[]
+}
+
+model RunMember {
+  id     String        @id @default(cuid())
+  runId  String
+  userId String
+  role   RunMemberRole @default(EDITOR)
+
+  run  ReconciliationRun @relation(fields: [runId], references: [id])
+  user User              @relation(fields: [userId], references: [id])
+
+  @@unique([runId, userId])
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  runId     String
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  run    ReconciliationRun @relation(fields: [runId], references: [id])
+  author User              @relation(fields: [authorId], references: [id])
+}
+
+model ExtractLine {
+  id          String   @id @default(cuid())
+  runId       String
+  date        DateTime?
+  concept     String?
+  amount      Float
+  amountKey   BigInt
+  raw         Json
+  categoryId  String?
+
+  run      ReconciliationRun @relation(fields: [runId], references: [id])
+  category ExpenseCategory?  @relation(fields: [categoryId], references: [id])
+  match    Match?
+  unmatched UnmatchedExtract?
+}
+
+model SystemLine {
+  id        String   @id @default(cuid())
+  runId     String
+  issueDate DateTime?
+  dueDate   DateTime?
+  amount    Float
+  amountKey BigInt
+  raw       Json
+
+  run      ReconciliationRun @relation(fields: [runId], references: [id])
+  match    Match?
+  unmatched UnmatchedSystem?
+  pendingItems PendingItem[]
+}
+
+model Match {
+  id            String   @id @default(cuid())
+  runId         String
+  extractLineId String
+  systemLineId  String
+  deltaDays     Int
+
+  run         ReconciliationRun @relation(fields: [runId], references: [id])
+  extractLine ExtractLine       @relation(fields: [extractLineId], references: [id])
+  systemLine  SystemLine        @relation(fields: [systemLineId], references: [id])
+
+  @@unique([extractLineId])
+  @@unique([systemLineId])
+}
+
+model UnmatchedExtract {
+  id            String   @id @default(cuid())
+  runId         String
+  extractLineId String
+
+  run         ReconciliationRun @relation(fields: [runId], references: [id])
+  extractLine ExtractLine       @relation(fields: [extractLineId], references: [id])
+
+  @@unique([extractLineId])
+}
+
+model UnmatchedSystem {
+  id           String   @id @default(cuid())
+  runId        String
+  systemLineId String
+  status       UnmatchedSystemStatus
+
+  run        ReconciliationRun @relation(fields: [runId], references: [id])
+  systemLine SystemLine        @relation(fields: [systemLineId], references: [id])
+
+  @@unique([systemLineId])
+}
+
+model ExpenseCategory {
+  id    String @id @default(cuid())
+  name  String @unique
+
+  rules ExpenseRule[]
+  lines ExtractLine[]
+}
+
+model ExpenseRule {
+  id              String @id @default(cuid())
+  categoryId      String
+  pattern         String
+  isRegex         Boolean @default(false)
+  caseSensitive   Boolean @default(false)
+
+  category ExpenseCategory @relation(fields: [categoryId], references: [id])
+}
+
+model PendingItem {
+  id          String   @id @default(cuid())
+  runId       String
+  area        String
+  status      PendingStatus @default(OPEN)
+  resolvedAt  DateTime?
+  note        String?
+  systemLineId String?
+
+  run ReconciliationRun @relation(fields: [runId], references: [id])
+  systemLine SystemLine? @relation(fields: [systemLineId], references: [id])
+}
+
+model Cheque {
+  id        String   @id @default(cuid())
+  runId     String
+  number    String?
+  issueDate DateTime?
+  dueDate   DateTime?
+  amount    Float
+  status    ChequeStatus @default(ISSUED)
+  note      String?
+
+  run ReconciliationRun @relation(fields: [runId], references: [id])
+}

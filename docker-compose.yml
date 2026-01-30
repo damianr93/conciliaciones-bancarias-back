@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: conciliaciones-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: conciliaciones
+      POSTGRES_PASSWORD: conciliaciones
+      POSTGRES_DB: conciliaciones
+    ports:
+      - "5432:5432"
+    volumes:
+      - conciliaciones_db:/var/lib/postgresql/data
+
+volumes:
+  conciliaciones_db:
