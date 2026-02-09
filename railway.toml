@@ -1,0 +1,5 @@
+[build]
+buildCommand = "npm run prisma:generate && npm run build"
+
+[deploy]
+startCommand = "npx prisma migrate deploy && npm run start"
