@@ -240,6 +240,20 @@ export class ReconciliationsService {
 
   async updateRun(runId: string, userId: string, data: { status?: RunStatus; bankName?: string | null }) {
     await this.assertAccess(runId, userId);
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { status: true, createdById: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    if (run.status === RunStatus.CLOSED) {
+      if (data.status === RunStatus.OPEN && run.createdById === userId) {
+        return this.prisma.reconciliationRun.update({
+          where: { id: runId },
+          data: { status: RunStatus.OPEN },
+        });
+      }
+      throw new ForbiddenException('Conciliación cerrada: solo el creador puede reabrirla');
+    }
     return this.prisma.reconciliationRun.update({
       where: { id: runId },
       data: {
@@ -249,8 +263,34 @@ export class ReconciliationsService {
     });
   }
 
+  async deleteRun(runId: string, userId: string) {
+    await this.assertAccess(runId, userId);
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { status: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    if (run.status !== RunStatus.OPEN) {
+      throw new ForbiddenException('Solo se puede borrar una conciliación abierta');
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.match.deleteMany({ where: { runId } });
+      await tx.unmatchedExtract.deleteMany({ where: { runId } });
+      await tx.unmatchedSystem.deleteMany({ where: { runId } });
+      await tx.pendingItem.deleteMany({ where: { runId } });
+      await tx.message.deleteMany({ where: { runId } });
+      await tx.runMember.deleteMany({ where: { runId } });
+      await tx.extractLine.deleteMany({ where: { runId } });
+      await tx.systemLine.deleteMany({ where: { runId } });
+      await tx.cheque.deleteMany({ where: { runId } });
+      await tx.reconciliationRun.delete({ where: { id: runId } });
+    });
+    return { deleted: true };
+  }
+
   async addExcludedConcept(runId: string, userId: string, concept: string) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       select: { excludeConcepts: true },
@@ -326,7 +366,8 @@ export class ReconciliationsService {
   }
 
   async updateSystemData(runId: string, userId: string, dto: UpdateSystemDto) {
-    const run = await this.assertAccess(runId, userId);
+    await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     const runWithCut = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       select: { cutDate: true },
@@ -454,7 +495,20 @@ export class ReconciliationsService {
     return run;
   }
 
+  private async assertRunOpen(runId: string) {
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { status: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    if (run.status === RunStatus.CLOSED) {
+      throw new ForbiddenException('Conciliación cerrada: no se puede editar');
+    }
+  }
+
   async shareRun(runId: string, userId: string, email: string, role: RunMemberRole) {
+    await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
     });
@@ -473,6 +527,7 @@ export class ReconciliationsService {
 
   async addMessage(runId: string, userId: string, body: string) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     return this.prisma.message.create({
       data: { runId, authorId: userId, body },
       include: { author: true },
@@ -661,6 +716,7 @@ export class ReconciliationsService {
 
   async createPending(runId: string, userId: string, dto: CreatePendingDto) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     return this.prisma.pendingItem.create({
       data: {
         runId,
@@ -673,6 +729,7 @@ export class ReconciliationsService {
 
   async resolvePending(runId: string, userId: string, pendingId: string, dto: ResolvePendingDto) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     return this.prisma.pendingItem.update({
       where: { id: pendingId },
       data: {
@@ -685,6 +742,7 @@ export class ReconciliationsService {
 
   async updatePendingStatus(runId: string, userId: string, pendingId: string, status: PendingStatus) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     return this.prisma.pendingItem.update({
       where: { id: pendingId },
       data: { status },
@@ -698,6 +756,7 @@ export class ReconciliationsService {
     extractLineIds: string[],
   ) {
     await this.assertAccess(runId, userId);
+    await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       include: {
@@ -742,7 +801,7 @@ export class ReconciliationsService {
 
   async notifyPending(runId: string, userId: string, dto: NotifyDto) {
     await this.assertAccess(runId, userId);
-    
+    await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       include: {

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -77,6 +78,12 @@ export class ReconciliationsController {
   ) {
     await this.service.assertAccess(id, req.user.sub);
     return this.service.updateRun(id, req.user.sub, body);
+  }
+
+  @Delete(':id')
+  async deleteRun(@Param('id') id: string, @Request() req: { user: { sub: string } }) {
+    await this.service.deleteRun(id, req.user.sub);
+    return { deleted: true };
   }
 
   @Post(':id/share')
