@@ -3,6 +3,7 @@
   "version": "1.0",
   "private": true,
   "type": "module",
+  "description": "",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/main.js",
