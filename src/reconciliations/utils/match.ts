@@ -1,5 +1,5 @@
 import dayjs from 'dayjs';
-import { toAmountKey } from './normalize.js';
+import { toAmountKey, toAmountKeySafe } from './normalize.js';
 
 export type ExtractLine = {
   id: string;
@@ -43,9 +43,10 @@ export function matchOneToOne(
 ) {
   const extractByKey = new Map<bigint, ExtractLine[]>();
   for (const ext of extractLines) {
-    const list = extractByKey.get(ext.amountKey) || [];
+    const key = toAmountKeySafe(ext.amountKey as bigint | string);
+    const list = extractByKey.get(key) || [];
     list.push(ext);
-    extractByKey.set(ext.amountKey, list);
+    extractByKey.set(key, list);
   }
 
   const usedExtract = new Set<string>();
@@ -54,7 +55,8 @@ export function matchOneToOne(
 
   for (const sys of systemLines) {
     if (usedSystem.has(sys.id)) continue;
-    const pool = extractByKey.get(sys.amountKey) || [];
+    const key = toAmountKeySafe(sys.amountKey as bigint | string);
+    const pool = extractByKey.get(key) || [];
     let best: ExtractLine | null = null;
     let bestDelta = 0;
     for (const ext of pool) {

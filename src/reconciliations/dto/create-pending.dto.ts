@@ -2,9 +2,7 @@ import { IsEnum, IsOptional, IsString } from 'class-validator';
 
 export enum AreaType {
   DIRECCION = 'Dirección',
-  PAGOS = 'Pagos',
-  ADMINISTRACION = 'Administración',
-  LOGISTICA = 'Logística',
+  TESORERIA = 'Tesorería',
 }
 
 export class CreatePendingDto {

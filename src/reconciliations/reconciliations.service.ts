@@ -16,7 +16,7 @@ import {
   parseDate,
   toAmountKey,
 } from './utils/normalize.js';
-import { matchOneToOne, matchManyToOneByComment } from './utils/match.js';
+import { matchOneToOne } from './utils/match.js';
 
 @Injectable()
 export class ReconciliationsService {
@@ -26,9 +26,15 @@ export class ReconciliationsService {
     const windowDays = dto.windowDays ?? 0;
     const cutDate = dto.cutDate ? parseDate(dto.cutDate) : null;
 
-    const categories = await this.prisma.expenseCategory.findMany({
+    let categories = await this.prisma.expenseCategory.findMany({
       include: { rules: true },
     });
+    const enabledIds = Array.isArray(dto.enabledCategoryIds) && dto.enabledCategoryIds.length > 0
+      ? new Set(dto.enabledCategoryIds)
+      : null;
+    if (enabledIds) {
+      categories = categories.filter((c) => enabledIds.has(c.id));
+    }
 
     const extractLines: Array<Prisma.ExtractLineCreateManyInput & { id: string }> = [];
     for (const row of dto.extract.rows) {
@@ -108,6 +114,7 @@ export class ReconciliationsService {
         windowDays,
         cutDate: cutDate ?? undefined,
         excludeConcepts: (dto.extract.excludeConcepts ?? []) as Prisma.JsonArray,
+        enabledCategoryIds: (dto.enabledCategoryIds ?? []) as Prisma.JsonArray,
         createdById: userId,
       },
     });
@@ -151,14 +158,7 @@ export class ReconciliationsService {
       windowDays,
     );
 
-    const commentMatches = matchManyToOneByComment(
-      systemForMatch,
-      extractForMatch,
-      usedExtract,
-      usedSystem,
-    );
-
-    const allMatches = [...matches, ...commentMatches];
+    const allMatches = matches;
 
     const unmatchedExtract = extractLines
       .filter((line) => !usedExtract.has(line.id))
@@ -221,25 +221,74 @@ export class ReconciliationsService {
         members: { include: { user: true } },
         messages: { include: { author: true } },
         pendingItems: { include: { systemLine: true } },
+        issues: { include: { createdBy: true, comments: { include: { author: true } } } },
       },
     });
     if (!run) return null;
     const activeExtractIds = new Set(
       run.extractLines.filter((l) => !l.excluded).map((l) => l.id),
     );
+    const extractAmountById = new Map(
+      run.extractLines.map((l) => [l.id, l.amount]),
+    );
+    const systemAmountById = new Map(run.systemLines.map((l) => [l.id, l.amount]));
+    const amountTolerance = 0.01;
+    const matchesWithSameAmount = run.matches.filter((m) => {
+      if (!activeExtractIds.has(m.extractLineId)) return false;
+      const extAmount = extractAmountById.get(m.extractLineId);
+      const sysAmount = systemAmountById.get(m.systemLineId);
+      if (extAmount == null || sysAmount == null) return false;
+      return Math.abs(extAmount - sysAmount) <= amountTolerance;
+    });
+    const hiddenMatches = run.matches.filter((m) => {
+      if (!activeExtractIds.has(m.extractLineId)) return false;
+      const extAmount = extractAmountById.get(m.extractLineId);
+      const sysAmount = systemAmountById.get(m.systemLineId);
+      if (extAmount == null || sysAmount == null) return true;
+      return Math.abs(extAmount - sysAmount) > amountTolerance;
+    });
+    const hiddenExtractIds = new Set(hiddenMatches.map((m) => m.extractLineId));
+    const hiddenSystemIds = new Set(hiddenMatches.map((m) => m.systemLineId));
+    const baseUnmatchedExtract = run.unmatchedExtract.filter((ue) =>
+      activeExtractIds.has(ue.extractLineId),
+    );
+    const extraUnmatchedExtract = [...hiddenExtractIds]
+      .filter((id) => activeExtractIds.has(id))
+      .map((extractLineId) => ({
+        id: randomUUID(),
+        runId: run.id,
+        extractLineId,
+      }));
+    const extraUnmatchedSystem = [...hiddenSystemIds].map((systemLineId) => {
+      const line = run.systemLines.find((l) => l.id === systemLineId);
+      const dateToCompare = line?.dueDate ?? line?.issueDate ?? null;
+      let status: UnmatchedSystemStatus = UnmatchedSystemStatus.DEFERRED;
+      if (run.cutDate && dateToCompare && dateToCompare <= run.cutDate) {
+        status = UnmatchedSystemStatus.OVERDUE;
+      }
+      return {
+        id: randomUUID(),
+        runId: run.id,
+        systemLineId,
+        status,
+      };
+    });
     return {
       ...run,
       excludeConcepts: (run.excludeConcepts as string[]) ?? [],
       extractLines: run.extractLines.filter((l) => !l.excluded),
-      matches: run.matches.filter((m) => activeExtractIds.has(m.extractLineId)),
-      unmatchedExtract: run.unmatchedExtract.filter((ue) =>
-        activeExtractIds.has(ue.extractLineId),
-      ),
+      matches: matchesWithSameAmount,
+      unmatchedExtract: [...baseUnmatchedExtract, ...extraUnmatchedExtract],
+      unmatchedSystem: [...run.unmatchedSystem, ...extraUnmatchedSystem],
     };
   }
 
-  async updateRun(runId: string, userId: string, data: { status?: RunStatus; bankName?: string | null }) {
-    await this.assertAccess(runId, userId);
+  async updateRun(
+    runId: string,
+    userId: string,
+    data: { status?: RunStatus; bankName?: string | null; enabledCategoryIds?: string[] },
+  ) {
+    await this.assertCanEdit(runId, userId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       select: { status: true, createdById: true },
@@ -259,12 +308,15 @@ export class ReconciliationsService {
       data: {
         ...(data.status != null && { status: data.status }),
         ...(data.bankName !== undefined && { bankName: data.bankName ?? null }),
+        ...(data.enabledCategoryIds !== undefined && {
+          enabledCategoryIds: data.enabledCategoryIds as Prisma.JsonArray,
+        }),
       },
     });
   }
 
   async deleteRun(runId: string, userId: string) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       select: { status: true },
@@ -289,7 +341,13 @@ export class ReconciliationsService {
   }
 
   async addExcludedConcept(runId: string, userId: string, concept: string) {
-    await this.assertAccess(runId, userId);
+    const normalized = (concept ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    if (!normalized) throw new BadRequestException('Concepto requerido');
+    return this.addExcludedConcepts(runId, userId, [concept.trim()]);
+  }
+
+  async addExcludedConcepts(runId: string, userId: string, concepts: string[]) {
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
@@ -298,35 +356,164 @@ export class ReconciliationsService {
     if (!run) throw new NotFoundException('Run no encontrado');
     const norm = (s: string | null | undefined) =>
       (s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
-    const normalized = norm(concept);
-    if (!normalized) throw new BadRequestException('Concepto requerido');
-
     const current = (run.excludeConcepts as string[]) ?? [];
-    if (current.some((c) => norm(c) === normalized)) {
-      return this.getRun(runId);
+    const nextConcepts = [...current];
+    const normalizedNew = new Set<string>();
+    for (const concept of concepts) {
+      const n = norm(concept);
+      if (!n) continue;
+      if (current.some((c) => norm(c) === n)) continue;
+      if (normalizedNew.has(n)) continue;
+      normalizedNew.add(n);
+      nextConcepts.push(concept.trim());
     }
-    const nextConcepts = [...current, concept.trim()];
+    if (nextConcepts.length === current.length) return this.getRun(runId);
 
     const linesToExclude = await this.prisma.extractLine.findMany({
-      where: {
-        runId,
-        excluded: false,
-        concept: { not: null },
-      },
+      where: { runId, excluded: false, concept: { not: null } },
     });
-    const toExclude = linesToExclude.filter(
-      (l) => norm(l.concept) === normalized,
+    const toExclude = linesToExclude.filter((l) =>
+      Array.from(normalizedNew).some((n) => norm(l.concept) === n),
     );
-    const extractIds = new Set(toExclude.map((l) => l.id));
 
-    await this.prisma.$transaction(async (tx) => {
-      await tx.reconciliationRun.update({
-        where: { id: runId },
-        data: { excludeConcepts: nextConcepts as Prisma.JsonArray },
+    const extractLineIds = toExclude.map((l) => l.id);
+    await this.applyExcludedLines(runId, nextConcepts as Prisma.JsonArray, extractLineIds);
+    return this.getRun(runId);
+  }
+
+  async addExcludedByCategory(runId: string, userId: string, categoryId: string) {
+    await this.assertCanEdit(runId, userId);
+    await this.assertRunOpen(runId);
+    const category = await this.prisma.expenseCategory.findUnique({
+      where: { id: categoryId },
+      include: { rules: true },
+    });
+    if (!category) throw new NotFoundException('Categoría no encontrada');
+    const rules = category.rules ?? [];
+    if (rules.length === 0) {
+      throw new BadRequestException(
+        'La categoría no tiene reglas. Agregá conceptos en Categorías para que coincidan con las líneas del extracto.',
+      );
+    }
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { excludeConcepts: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    const norm = (s: string | null | undefined) =>
+      (s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const current = (run.excludeConcepts as string[]) ?? [];
+    const categoryNorm = norm(category.name);
+    if (current.some((c) => norm(c) === categoryNorm)) {
+      return this.getRun(runId);
+    }
+    const nextConcepts = [...current, category.name];
+
+    const candidates = await this.prisma.extractLine.findMany({
+      where: { runId, excluded: false, concept: { not: null } },
+    });
+    const toExclude = candidates.filter((line) =>
+      this.conceptMatchesCategory(line.concept, category),
+    );
+    if (toExclude.length === 0) return this.getRun(runId);
+
+    const extractLineIds = toExclude.map((l) => l.id);
+    await this.applyExcludedLines(runId, nextConcepts as Prisma.JsonArray, extractLineIds);
+    return this.getRun(runId);
+  }
+
+  async removeExcludedConcept(runId: string, userId: string, concept: string) {
+    await this.assertCanEdit(runId, userId);
+    await this.assertRunOpen(runId);
+    const norm = (s: string | null | undefined) =>
+      (s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { excludeConcepts: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    const current = (run.excludeConcepts as string[]) ?? [];
+    const nextConcepts = current.filter((c) => norm(c) !== norm(concept));
+    if (nextConcepts.length === current.length) return this.getRun(runId);
+
+    const category = await this.prisma.expenseCategory.findFirst({
+      where: { name: { equals: concept, mode: 'insensitive' } },
+      include: { rules: true },
+    });
+    const excludedLines = await this.prisma.extractLine.findMany({
+      where: { runId, excluded: true },
+    });
+    const toUnexclude =
+      category && (category.rules ?? []).length > 0
+        ? excludedLines.filter((line) =>
+            this.conceptMatchesCategory(line.concept, category),
+          )
+        : excludedLines.filter((line) => norm(line.concept) === norm(concept));
+
+    await this.prisma.reconciliationRun.update({
+      where: { id: runId },
+      data: { excludeConcepts: nextConcepts as Prisma.JsonArray },
+    });
+    if (toUnexclude.length > 0) {
+      await this.prisma.extractLine.updateMany({
+        where: { id: { in: toUnexclude.map((l) => l.id) } },
+        data: { excluded: false },
       });
-      for (const line of toExclude) {
+      await this.recomputeMatches(runId);
+    }
+    return this.getRun(runId);
+  }
+
+  private conceptMatchesCategory(
+    concept: string | null,
+    category: { rules?: Array<{ pattern: string; isRegex: boolean; caseSensitive: boolean }> | null },
+  ): boolean {
+    if (!concept) return false;
+    const rules = category.rules ?? [];
+    const normSpace = (s: string) =>
+      s
+        .replace(/\u00A0/g, ' ')
+        .trim()
+        .replace(/\s+/g, ' ');
+    for (const rule of rules) {
+      const pattern = rule.pattern.trim();
+      if (!pattern) continue;
+      if (rule.isRegex) {
+        try {
+          const re = new RegExp(pattern, rule.caseSensitive ? '' : 'i');
+          if (re.test(concept)) return true;
+        } catch {
+          const haystack = normSpace(rule.caseSensitive ? concept : concept.toLowerCase());
+          const needle = normSpace(rule.caseSensitive ? pattern : pattern.toLowerCase());
+          if (haystack.includes(needle)) return true;
+        }
+      } else {
+        const haystack = normSpace(rule.caseSensitive ? concept : concept.toLowerCase());
+        const needle = normSpace(rule.caseSensitive ? pattern : pattern.toLowerCase());
+        if (haystack.includes(needle)) return true;
+      }
+    }
+    return false;
+  }
+
+  private async applyExcludedLines(
+    runId: string,
+    nextConcepts: Prisma.JsonArray,
+    extractLineIds: string[],
+  ) {
+    await this.prisma.reconciliationRun.update({
+      where: { id: runId },
+      data: { excludeConcepts: nextConcepts },
+    });
+    const cut = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { cutDate: true },
+    });
+    const cutDate = cut?.cutDate ?? null;
+    for (const extractLineId of extractLineIds) {
+      await this.prisma.$transaction(async (tx) => {
         const matches = await tx.match.findMany({
-          where: { extractLineId: line.id },
+          where: { extractLineId },
         });
         for (const m of matches) {
           await tx.match.delete({ where: { id: m.id } });
@@ -338,13 +525,9 @@ export class ReconciliationsService {
               where: { id: m.systemLineId },
               select: { dueDate: true, issueDate: true },
             });
-            const cut = await tx.reconciliationRun.findUnique({
-              where: { id: runId },
-              select: { cutDate: true },
-            });
             const dt = sys?.dueDate ?? sys?.issueDate ?? null;
             const status =
-              cut?.cutDate && dt && dt <= cut.cutDate
+              cutDate && dt && dt <= cutDate
                 ? UnmatchedSystemStatus.OVERDUE
                 : UnmatchedSystemStatus.DEFERRED;
             await tx.unmatchedSystem.create({
@@ -353,20 +536,18 @@ export class ReconciliationsService {
           }
         }
         await tx.unmatchedExtract.deleteMany({
-          where: { extractLineId: line.id },
+          where: { extractLineId },
         });
         await tx.extractLine.update({
-          where: { id: line.id },
+          where: { id: extractLineId },
           data: { excluded: true },
         });
-      }
-    });
-
-    return this.getRun(runId);
+      });
+    }
   }
 
   async updateSystemData(runId: string, userId: string, dto: UpdateSystemDto) {
-    await this.assertAccess(runId, userId);
+    await this.assertRunExists(runId);
     await this.assertRunOpen(runId);
     const runWithCut = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
@@ -434,65 +615,156 @@ export class ReconciliationsService {
       }
     }
 
-    await this.prisma.$transaction(async (tx) => {
-      for (const u of toUpdate) {
-        await tx.systemLine.update({
-          where: { id: u.id },
-          data: {
-            amount: u.amount,
-            amountKey: u.amountKey,
-            issueDate: u.issueDate,
-            dueDate: u.dueDate,
-            description: u.description,
-            raw: u.raw,
-          },
-        });
-      }
-      if (toCreate.length > 0) {
-        await tx.systemLine.createMany({ data: toCreate });
-        for (const line of toCreate) {
-          const dt = line.dueDate ?? line.issueDate ?? null;
-          const dtDate = dt instanceof Date ? dt : (dt ? new Date(dt as unknown as string) : null);
-          const status =
-            cutDate && dtDate && dtDate <= cutDate ? UnmatchedSystemStatus.OVERDUE : UnmatchedSystemStatus.DEFERRED;
-          await tx.unmatchedSystem.create({
+    const TX_TIMEOUT_MS = 60_000;
+    await this.prisma.$transaction(
+      async (tx) => {
+        for (const u of toUpdate) {
+          await tx.systemLine.update({
+            where: { id: u.id },
             data: {
-              runId,
-              systemLineId: line.id,
-              status,
+              amount: u.amount,
+              amountKey: u.amountKey,
+              issueDate: u.issueDate,
+              dueDate: u.dueDate,
+              description: u.description,
+              raw: u.raw,
             },
           });
         }
-      }
-    });
+        if (toCreate.length > 0) {
+          await tx.systemLine.createMany({ data: toCreate });
+          const unmatchedSystemRows = toCreate.map((line) => {
+            const dt = line.dueDate ?? line.issueDate ?? null;
+            const dtDate = dt instanceof Date ? dt : (dt ? new Date(dt as unknown as string) : null);
+            const status =
+              cutDate && dtDate && dtDate <= cutDate ? UnmatchedSystemStatus.OVERDUE : UnmatchedSystemStatus.DEFERRED;
+            return { runId, systemLineId: line.id, status };
+          });
+          await tx.unmatchedSystem.createMany({ data: unmatchedSystemRows });
+        }
+      },
+      { timeout: TX_TIMEOUT_MS },
+    );
 
+    await this.recomputeMatches(runId);
     return this.getRun(runId);
   }
 
-  listRuns(userId: string) {
+  private async recomputeMatches(runId: string) {
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { windowDays: true, cutDate: true },
+    });
+    if (!run) return;
+    const windowDays = run.windowDays ?? 0;
+    const cutDate = run.cutDate;
+
+    const extractLines = await this.prisma.extractLine.findMany({
+      where: { runId, excluded: false },
+    });
+    const systemLines = await this.prisma.systemLine.findMany({
+      where: { runId },
+    });
+
+    const systemForMatch = systemLines.map((line) => ({
+      id: line.id,
+      issueDate: line.issueDate ? new Date(line.issueDate) : null,
+      dueDate: line.dueDate ? new Date(line.dueDate) : null,
+      amountKey: line.amountKey as bigint,
+      amount: line.amount,
+      description: line.description ?? null,
+    }));
+    const extractForMatch = extractLines.map((line) => ({
+      id: line.id,
+      date: line.date ? new Date(line.date) : null,
+      amountKey: line.amountKey as bigint,
+    }));
+
+    const { matches, usedExtract, usedSystem } = matchOneToOne(
+      systemForMatch,
+      extractForMatch,
+      windowDays,
+    );
+
+    const unmatchedExtract = extractLines
+      .filter((line) => !usedExtract.has(line.id))
+      .map((line) => ({
+        id: randomUUID(),
+        runId,
+        extractLineId: line.id,
+      }));
+
+    const unmatchedSystem = systemLines
+      .filter((line) => !usedSystem.has(line.id))
+      .map((line) => {
+        const dateToCompare = line.dueDate ?? line.issueDate ?? null;
+        let status: UnmatchedSystemStatus = UnmatchedSystemStatus.DEFERRED;
+        if (cutDate && dateToCompare && dateToCompare <= cutDate) {
+          status = UnmatchedSystemStatus.OVERDUE;
+        }
+        return {
+          id: randomUUID(),
+          runId,
+          systemLineId: line.id,
+          status,
+        };
+      });
+
+    const matchRows = matches.map((match) => ({
+      id: randomUUID(),
+      runId,
+      extractLineId: match.extractId,
+      systemLineId: match.systemId,
+      deltaDays: match.deltaDays,
+    }));
+
+    await this.prisma.$transaction([
+      this.prisma.match.deleteMany({ where: { runId } }),
+      this.prisma.unmatchedExtract.deleteMany({ where: { runId } }),
+      this.prisma.unmatchedSystem.deleteMany({ where: { runId } }),
+      this.prisma.match.createMany({ data: matchRows }),
+      this.prisma.unmatchedExtract.createMany({ data: unmatchedExtract }),
+      this.prisma.unmatchedSystem.createMany({ data: unmatchedSystem }),
+    ]);
+  }
+
+  listRuns() {
     return this.prisma.reconciliationRun.findMany({
-      where: {
-        OR: [
-          { createdById: userId },
-          { members: { some: { userId } } },
-        ],
-      },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async assertAccess(runId: string, userId: string) {
+  private async assertRunExists(runId: string) {
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { id: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+  }
+
+  async assertCanEdit(runId: string, userId: string) {
+    await this.assertRunExists(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
       include: { members: true },
     });
-    if (!run) throw new NotFoundException('Run no encontrado');
+    if (!run) return;
     const isOwner = run.createdById === userId;
-    const isMember = run.members.some((member) => member.userId === userId);
-    if (!isOwner && !isMember) {
-      throw new ForbiddenException('Sin acceso');
+    const isAdmin = run.members.some((m) => m.userId === userId && m.role === RunMemberRole.EDITOR);
+    if (!isOwner && !isAdmin) {
+      throw new ForbiddenException('Solo el propietario o un usuario con permiso de admin pueden editar');
     }
-    return run;
+  }
+
+  private async assertOwner(runId: string, userId: string) {
+    await this.assertRunExists(runId);
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { createdById: true },
+    });
+    if (!run || run.createdById !== userId) {
+      throw new ForbiddenException('Solo el propietario puede gestionar permisos');
+    }
   }
 
   private async assertRunOpen(runId: string) {
@@ -507,15 +779,8 @@ export class ReconciliationsService {
   }
 
   async shareRun(runId: string, userId: string, email: string, role: RunMemberRole) {
-    await this.assertAccess(runId, userId);
+    await this.assertOwner(runId, userId);
     await this.assertRunOpen(runId);
-    const run = await this.prisma.reconciliationRun.findUnique({
-      where: { id: runId },
-    });
-    if (!run) throw new NotFoundException('Run no encontrado');
-    if (run.createdById !== userId) {
-      throw new ForbiddenException('Solo el owner puede compartir');
-    }
     const user = await this.prisma.user.findUnique({ where: { email } });
     if (!user) throw new NotFoundException('Usuario no encontrado');
     return this.prisma.runMember.upsert({
@@ -525,8 +790,16 @@ export class ReconciliationsService {
     });
   }
 
+  async removeMember(runId: string, ownerUserId: string, targetUserId: string) {
+    await this.assertOwner(runId, ownerUserId);
+    await this.prisma.runMember.deleteMany({
+      where: { runId, userId: targetUserId },
+    });
+    return { removed: true };
+  }
+
   async addMessage(runId: string, userId: string, body: string) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     return this.prisma.message.create({
       data: { runId, authorId: userId, body },
@@ -537,7 +810,7 @@ export class ReconciliationsService {
   async exportRun(runId: string, userId: string) {
     const run = await this.getRun(runId);
     if (!run) throw new NotFoundException('Run no encontrado');
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
 
     const extractById = new Map(run.extractLines.map((line) => [line.id, line]));
     const systemById = new Map(run.systemLines.map((line) => [line.id, line]));
@@ -699,15 +972,24 @@ export class ReconciliationsService {
     categories: Array<{ id: string; rules: Array<{ pattern: string; isRegex: boolean; caseSensitive: boolean }> }>,
   ) {
     if (!concept) return null;
+    const normSpace = (s: string) => s.trim().replace(/\s+/g, ' ');
     for (const category of categories) {
       for (const rule of category.rules) {
-        const haystack = rule.caseSensitive ? concept : concept.toLowerCase();
-        const needle = rule.caseSensitive ? rule.pattern : rule.pattern.toLowerCase();
+        const pattern = rule.pattern.trim();
+        if (!pattern) continue;
         if (rule.isRegex) {
-          const re = new RegExp(needle, rule.caseSensitive ? '' : 'i');
-          if (re.test(concept)) return category.id;
-        } else if (haystack.includes(needle)) {
-          return category.id;
+          try {
+            const re = new RegExp(pattern, rule.caseSensitive ? '' : 'i');
+            if (re.test(concept)) return category.id;
+          } catch {
+            const haystack = normSpace(rule.caseSensitive ? concept : concept.toLowerCase());
+            const needle = normSpace(rule.caseSensitive ? pattern : pattern.toLowerCase());
+            if (haystack.includes(needle)) return category.id;
+          }
+        } else {
+          const haystack = normSpace(rule.caseSensitive ? concept : concept.toLowerCase());
+          const needle = normSpace(rule.caseSensitive ? pattern : pattern.toLowerCase());
+          if (haystack.includes(needle)) return category.id;
         }
       }
     }
@@ -715,7 +997,7 @@ export class ReconciliationsService {
   }
 
   async createPending(runId: string, userId: string, dto: CreatePendingDto) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     return this.prisma.pendingItem.create({
       data: {
@@ -728,7 +1010,7 @@ export class ReconciliationsService {
   }
 
   async resolvePending(runId: string, userId: string, pendingId: string, dto: ResolvePendingDto) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     return this.prisma.pendingItem.update({
       where: { id: pendingId },
@@ -741,7 +1023,7 @@ export class ReconciliationsService {
   }
 
   async updatePendingStatus(runId: string, userId: string, pendingId: string, status: PendingStatus) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     return this.prisma.pendingItem.update({
       where: { id: pendingId },
@@ -755,7 +1037,7 @@ export class ReconciliationsService {
     systemLineId: string,
     extractLineIds: string[],
   ) {
-    await this.assertAccess(runId, userId);
+    await this.assertCanEdit(runId, userId);
     await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
@@ -800,7 +1082,7 @@ export class ReconciliationsService {
   }
 
   async notifyPending(runId: string, userId: string, dto: NotifyDto) {
-    await this.assertAccess(runId, userId);
+    await this.assertRunExists(runId);
     await this.assertRunOpen(runId);
     const run = await this.prisma.reconciliationRun.findUnique({
       where: { id: runId },
@@ -839,14 +1121,19 @@ export class ReconciliationsService {
 
     const areaEmails: Record<string, string> = {
       'Dirección': process.env.EMAIL_DIRECCION || '',
-      'Pagos': process.env.EMAIL_PAGOS || '',
-      'Administración': process.env.EMAIL_ADMINISTRACION || '',
-      'Logística': process.env.EMAIL_LOGISTICA || '',
+      'Tesorería': process.env.EMAIL_TESORERIA || '',
     };
+
+    const areasSinEmail = dto.areas.filter((a) => !areaEmails[a]?.trim());
+    if (areasSinEmail.length > 0) {
+      throw new BadRequestException(
+        `No hay email configurado para: ${areasSinEmail.join(', ')}. En el servidor configurar EMAIL_DIRECCION y/o EMAIL_TESORERIA.`,
+      );
+    }
 
     const results = [];
     for (const area of dto.areas) {
-      const areaEmail = areaEmails[area];
+      const areaEmail = (areaEmails[area] || '').trim();
       if (!areaEmail) continue;
 
       const areaPending = run.pendingItems.filter((p) => p.area === area);
@@ -913,5 +1200,65 @@ export class ReconciliationsService {
       if (value instanceof Date) return value;
     }
     return value as any;
+  }
+
+  async createIssue(
+    runId: string,
+    userId: string,
+    data: { title: string; body?: string },
+  ) {
+    await this.assertRunExists(runId);
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { id: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    return this.prisma.issue.create({
+      data: {
+        runId,
+        title: data.title,
+        body: data.body ?? null,
+        createdById: userId,
+      },
+      include: { createdBy: true, comments: { include: { author: true } } },
+    });
+  }
+
+  async updateIssue(
+    runId: string,
+    issueId: string,
+    userId: string,
+    data: { title?: string; body?: string },
+  ) {
+    await this.assertRunExists(runId);
+    const run = await this.prisma.reconciliationRun.findUnique({
+      where: { id: runId },
+      select: { createdById: true },
+    });
+    if (!run) throw new NotFoundException('Run no encontrado');
+    if (run.createdById !== userId) {
+      throw new ForbiddenException('Solo la propietaria de la conciliación puede editar el issue');
+    }
+    return this.prisma.issue.update({
+      where: { id: issueId, runId },
+      data: {
+        ...(data.title != null && { title: data.title }),
+        ...(data.body !== undefined && { body: data.body }),
+      },
+      include: { createdBy: true, comments: { include: { author: true } } },
+    });
+  }
+
+  async addIssueComment(issueId: string, userId: string, body: string) {
+    const issue = await this.prisma.issue.findUnique({
+      where: { id: issueId },
+      select: { runId: true },
+    });
+    if (!issue) throw new NotFoundException('Issue no encontrado');
+    await this.assertRunExists(issue.runId);
+    return this.prisma.issueComment.create({
+      data: { issueId, authorId: userId, body },
+      include: { author: true },
+    });
   }
 }

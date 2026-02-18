@@ -81,6 +81,12 @@ export function toAmountKey(amount: number, decimals = 2): bigint {
   return BigInt(Math.round(amount * factor));
 }
 
+export function toAmountKeySafe(value: bigint | string | number): bigint {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'string') return BigInt(value);
+  return BigInt(Math.round(Number(value)));
+}
+
 export function extractAmount(
   row: Record<string, unknown>,
   mode: AmountMode,

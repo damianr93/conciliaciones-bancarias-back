@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
@@ -23,6 +24,10 @@ import { CreatePendingDto, ResolvePendingDto } from './dto/create-pending.dto.js
 import { NotifyDto } from './dto/notify.dto.js';
 import { SetMatchDto } from './dto/set-match.dto.js';
 import { AddExcludedConceptDto } from './dto/add-excluded-concept.dto.js';
+import { ExcludeManyDto } from './dto/exclude-many.dto.js';
+import { ExcludeByCategoryDto } from './dto/exclude-by-category.dto.js';
+import { RemoveExcludedConceptDto } from './dto/remove-excluded-concept.dto.js';
+import { CreateIssueDto, UpdateIssueDto, CreateIssueCommentDto } from './dto/create-issue.dto.js';
 import type { Response } from 'express';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ParseFileDto } from './dto/parse-file.dto.js';
@@ -41,14 +46,56 @@ export class ReconciliationsController {
   }
 
   @Get()
-  list(@Request() req: { user: { sub: string } }) {
-    return this.service.listRuns(req.user.sub);
+  list() {
+    return this.service.listRuns();
+  }
+
+  @Post(':id/issues')
+  createIssue(
+    @Param('id') id: string,
+    @Body() dto: CreateIssueDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.createIssue(id, req.user.sub, { title: dto.title, body: dto.body });
+  }
+
+  @Patch(':id/issues/:issueId')
+  updateIssue(
+    @Param('id') id: string,
+    @Param('issueId') issueId: string,
+    @Body() dto: UpdateIssueDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.updateIssue(id, issueId, req.user.sub, {
+      title: dto.title,
+      body: dto.body,
+    });
+  }
+
+  @Post(':id/issues/:issueId/comments')
+  addIssueComment(
+    @Param('id') id: string,
+    @Param('issueId') issueId: string,
+    @Body() dto: CreateIssueCommentDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.addIssueComment(issueId, req.user.sub, dto.body);
+  }
+
+  @Delete(':id/members/:userId')
+  removeMember(
+    @Param('id') id: string,
+    @Param('userId') userId: string,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.removeMember(id, req.user.sub, userId);
   }
 
   @Get(':id')
-  async get(@Param('id') id: string, @Request() req: { user: { sub: string } }) {
-    await this.service.assertAccess(id, req.user.sub);
-    return this.service.getRun(id);
+  async get(@Param('id') id: string) {
+    const run = await this.service.getRun(id);
+    if (!run) throw new NotFoundException('Run no encontrado');
+    return run;
   }
 
   @Patch(':id/system')
@@ -57,7 +104,7 @@ export class ReconciliationsController {
     @Body() dto: UpdateSystemDto,
     @Request() req: { user: { sub: string } },
   ) {
-    await this.service.assertAccess(id, req.user.sub);
+    await this.service.assertCanEdit(id, req.user.sub);
     return this.service.updateSystemData(id, req.user.sub, dto);
   }
 
@@ -70,13 +117,40 @@ export class ReconciliationsController {
     return this.service.addExcludedConcept(id, req.user.sub, dto.concept);
   }
 
+  @Patch(':id/exclude-concepts')
+  addExcludedConcepts(
+    @Param('id') id: string,
+    @Body() dto: ExcludeManyDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.addExcludedConcepts(id, req.user.sub, dto.concepts);
+  }
+
+  @Patch(':id/exclude-by-category')
+  addExcludedByCategory(
+    @Param('id') id: string,
+    @Body() dto: ExcludeByCategoryDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.addExcludedByCategory(id, req.user.sub, dto.categoryId);
+  }
+
+  @Patch(':id/remove-excluded-concept')
+  removeExcludedConcept(
+    @Param('id') id: string,
+    @Body() dto: RemoveExcludedConceptDto,
+    @Request() req: { user: { sub: string } },
+  ) {
+    return this.service.removeExcludedConcept(id, req.user.sub, dto.concept);
+  }
+
   @Patch(':id')
   async updateRun(
     @Param('id') id: string,
-    @Body() body: { status?: RunStatus; bankName?: string },
+    @Body() body: { status?: RunStatus; bankName?: string; enabledCategoryIds?: string[] },
     @Request() req: { user: { sub: string } },
   ) {
-    await this.service.assertAccess(id, req.user.sub);
+    await this.service.assertCanEdit(id, req.user.sub);
     return this.service.updateRun(id, req.user.sub, body);
   }
 

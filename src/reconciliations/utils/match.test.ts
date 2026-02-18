@@ -105,4 +105,19 @@ describe('matchOneToOne', () => {
 
     expect(matches).toHaveLength(1);
   });
+
+  it('should match when amountKey is string (e.g. from JSON/Prisma)', () => {
+    const systemLines = [
+      { id: 's1', issueDate: new Date('2024-01-15'), dueDate: null, amountKey: '850000000' as unknown as bigint },
+    ];
+    const extractLines = [
+      { id: 'e1', date: new Date('2024-01-15'), amountKey: 850000000n },
+    ];
+
+    const { matches } = matchOneToOne(systemLines, extractLines, 0);
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0].extractId).toBe('e1');
+    expect(matches[0].systemId).toBe('s1');
+  });
 });

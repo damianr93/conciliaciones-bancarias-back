@@ -53,4 +53,9 @@ export class CreateRunDto {
   @ValidateNested()
   @Type(() => SystemDatasetDto)
   system!: SystemDatasetDto;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  enabledCategoryIds?: string[];
 }
