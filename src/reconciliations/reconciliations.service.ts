@@ -1102,21 +1102,24 @@ export class ReconciliationsService {
       throw new BadRequestException('No hay pendientes para las áreas seleccionadas');
     }
 
-    const smtpHost = process.env.SMTP_HOST || 'smtp.donweb.com';
-    const smtpPort = parseInt(process.env.SMTP_PORT || '587');
-    const smtpUser = process.env.SMTP_USER;
-    const smtpPass = process.env.SMTP_PASS;
-    const smtpFrom = process.env.SMTP_FROM || smtpUser;
+    const mailerHost = process.env.MAILER_HOST || process.env.SMTP_HOST;
+    const mailerEmail = process.env.MAILER_EMAIL || process.env.SMTP_USER;
+    const mailerSecret = process.env.MAILER_SECRET_KEY || process.env.SMTP_PASS;
+    const mailerPort = process.env.MAILER_PORT || process.env.SMTP_PORT || (mailerHost === 'smtp.gmail.com' ? '587' : '587');
+    const from = process.env.SMTP_FROM || mailerEmail;
 
-    if (!smtpUser || !smtpPass) {
-      throw new BadRequestException('SMTP no configurado. Configurar SMTP_USER y SMTP_PASS en variables de entorno');
+    if (!mailerHost || !mailerEmail || !mailerSecret) {
+      throw new BadRequestException(
+        'Correo no configurado. Configurar MAILER_HOST, MAILER_EMAIL y MAILER_SECRET_KEY (o SMTP_*) en variables de entorno',
+      );
     }
 
+    const port = parseInt(String(mailerPort), 10);
     const transporter = nodemailer.createTransport({
-      host: smtpHost,
-      port: smtpPort,
-      secure: smtpPort === 465,
-      auth: { user: smtpUser, pass: smtpPass },
+      host: mailerHost,
+      port,
+      secure: port === 465,
+      auth: { user: mailerEmail, pass: mailerSecret },
     });
 
     const areaEmails: Record<string, string> = {
@@ -1179,7 +1182,7 @@ export class ReconciliationsService {
 
       try {
         await transporter.sendMail({
-          from: smtpFrom,
+          from,
           to: areaEmail,
           subject: `Conciliación Bancaria - Movimientos Pendientes [${area}]`,
           html,
