@@ -1120,6 +1120,8 @@ export class ReconciliationsService {
       port,
       secure: port === 465,
       auth: { user: mailerEmail, pass: mailerSecret },
+      connectionTimeout: 15_000,
+      greetingTimeout: 15_000,
     });
 
     const areaEmails: Record<string, string> = {
